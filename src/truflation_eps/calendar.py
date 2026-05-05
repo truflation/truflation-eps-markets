@@ -11,20 +11,28 @@ from datetime import date, timedelta
 from typing import Optional
 
 from .fmp_client import AnalystEstimate, FMPClient, TOP_10
+from .yahoo_client import YahooClient
 
 
 @dataclass(frozen=True)
 class UpcomingEarnings:
     symbol: str
     earnings_date: str                # 'YYYY-MM-DD'
-    release_timing: Optional[str]     # 'bmo' | 'amc' | None
+    release_timing: Optional[str]     # 'bmo' | 'amc' | None — sourced from Yahoo
+    scheduled_at: Optional[str]       # full ISO datetime with tz, sourced from Yahoo
     estimate: Optional[AnalystEstimate]  # closest-matching analyst-estimates row
 
 
 def discover_upcoming(client: FMPClient,
                       universe: list[str] = TOP_10,
-                      lookahead_days: int = 90) -> list[UpcomingEarnings]:
-    """For each symbol in `universe`, find the next earnings date + matched estimate."""
+                      lookahead_days: int = 90,
+                      yahoo: Optional[YahooClient] = None) -> list[UpcomingEarnings]:
+    """For each symbol in `universe`, find the next earnings date + matched estimate.
+
+    If `yahoo` is provided, the release_timing (bmo/amc) and scheduled_at fields
+    are populated from Yahoo Finance as a secondary source, since FMP /stable/
+    endpoints don't carry release-time information.
+    """
     today = date.today()
     horizon = today + timedelta(days=lookahead_days)
     cal = client.earnings_calendar(from_date=today, to_date=horizon)
@@ -47,11 +55,23 @@ def discover_upcoming(client: FMPClient,
             est_list = []
         earnings_dt = date.fromisoformat(row.date)
         matched = _closest_estimate(est_list, earnings_dt)
+
+        timing, scheduled_at = None, None
+        if yahoo is not None:
+            try:
+                y_row = yahoo.timing_for_date(sym, row.date)
+                if y_row is not None:
+                    timing = y_row.bmo_amc
+                    scheduled_at = y_row.scheduled_at
+            except Exception:
+                pass
+
         out.append(
             UpcomingEarnings(
                 symbol=sym,
                 earnings_date=row.date,
-                release_timing=None,  # FMP stable endpoint doesn't return bmo/amc
+                release_timing=timing,
+                scheduled_at=scheduled_at,
                 estimate=matched,
             )
         )

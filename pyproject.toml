@@ -8,6 +8,8 @@ dependencies = [
     "python-dotenv>=1.0",
     "pandas>=2.2",
     "matplotlib>=3.9",
+    "yfinance>=0.2",
+    "lxml>=5.0",
 ]
 
 [tool.uv]

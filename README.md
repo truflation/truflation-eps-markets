@@ -97,6 +97,69 @@ FMP returns both where available. For US mega-cap equities, Polymarket and most 
 
 **Legacy `/api/v3/` endpoints return 403.** FMP deprecated its legacy earnings endpoints in August 2025. Only `/stable/` variants work. Any older integration referencing `/api/v3/earnings-calendar` will 403.
 
+**FMP `/stable/` does not return release time-of-day.** Empirically verified across `/stable/earnings-calendar`, `/stable/earnings`, and the deprecated `/api/v3/` variants — none expose a `time` field or BMO/AMC marker. The legacy v3 endpoints carried `"amc"` / `"bmo"` values but are now 403'd for any account not subscribed before Aug 31 2025. Release timing must come from a secondary source — see [§ Release timing](#release-timing--secondary-source) below.
+
+---
+
+## Release timing — secondary source
+
+For any production market that needs to lock or settle relative to the actual release moment (e.g., "freeze quotes 30 min before scheduled release"), FMP alone is insufficient. The repo ships a thin Yahoo Finance client (`yahoo_client.py`) that fills this gap. No API key required.
+
+### Source comparison
+
+| Source | API key | Time field | Coverage on top 10 (May 2026) | Notes |
+|---|---|---|---|---|
+| **FMP `/stable/`** | yes (paid) | None | n/a | EPS values only |
+| **NASDAQ public API** | no | `time-pre-market` / `time-after-hours` / `time-not-supplied` | ~95% on upcoming releases (T+1 to T+7), ~1% post-release | Stub-heavy; usable as a fallback only for upcoming events |
+| **Yahoo Finance (yfinance)** | no | Full timezone-aware datetime | 100% | Production-ready for timing; same EPS values FMP returns |
+
+### Yahoo output (one row per scheduled event)
+
+The `YahooClient.earnings_dates(symbol)` method returns one `YahooEarningsRow` per quarter, fields:
+
+| Field | Meaning |
+|---|---|
+| `symbol` | Ticker |
+| `scheduled_at` | ISO datetime in `America/New_York`, e.g. `2026-07-30T16:00:00-04:00` |
+| `date` | `YYYY-MM-DD` from `scheduled_at` |
+| `hour_et` | Integer hour (0–23) — 8 ⇒ BMO, 16 ⇒ AMC, 12–13 ⇒ mid-day |
+| `bmo_amc` | `"bmo"` if `hour_et ≤ 9`, `"amc"` if `hour_et ≥ 14`, else `None` |
+| `eps_estimated` | Yahoo's view of consensus (matches FMP within rounding) |
+| `eps_actual` | Reported EPS (matches FMP within rounding) |
+| `surprise_pct` | Pre-computed `(actual − estimated) / estimated × 100` |
+
+### Coverage observed on top 10
+
+```
+Symbol  ScheduledAt                  BMO/AMC
+AAPL    2026-07-30T16:00:00-04:00    AMC
+MSFT    2026-07-29T16:00:00-04:00    AMC
+GOOGL   2026-07-23T16:00:00-04:00    AMC
+AMZN    2026-07-30T16:00:00-04:00    AMC
+META    2026-07-29T16:00:00-04:00    AMC
+NVDA    2026-05-20T16:00:00-04:00    AMC
+TSLA    2026-07-22T16:00:00-04:00    AMC
+AVGO    2026-06-03T16:00:00-04:00    AMC
+V       2026-07-28T16:00:00-04:00    AMC
+JPM     2026-07-14T08:00:00-04:00    BMO   ← banks pre-market
+```
+
+JPM at 8am ET is the cleanest sanity check on the BMO/AMC inference: financials consistently report pre-market.
+
+### Recommended source split
+
+| Field | Primary | Fallback |
+|---|---|---|
+| EPS estimate, actual, history | FMP (paid, contractual) | Yahoo (same values) |
+| Release date + time | Yahoo | NASDAQ for upcoming events only |
+| Cross-check on release day | NASDAQ | — |
+
+### Risks of relying on Yahoo
+
+1. **Unofficial endpoint** — `yfinance` scrapes `finance.yahoo.com`. Yahoo can break the page format without notice; observed ~3 incidents in the last 24 months, each fixed within days.
+2. **ToS gray zone** — Yahoo's ToS technically prohibit commercial scraping. Most quant shops use it anyway and the underlying values aren't copyrightable, but a Truflation-signed stream sourcing from Yahoo deserves a legal sanity check before mainnet.
+3. **No SLA** — fine for a data-adapter spec, less fine for a settling daemon. A production deployment should treat Yahoo as a redundancy/observability source and persist the captured timestamp at announcement, not query it on the settlement path.
+
 ---
 
 ## Bucket construction — two strategies
@@ -201,13 +264,14 @@ On this particular quarter, **Strategy A produces a wider bucket span than Strat
 
 ## What this repo demonstrates
 
-Run `uv run python scripts/probe_fmp.py` to see all five demonstrations:
+Run `uv run python scripts/probe_fmp.py` to see all six demonstrations:
 
 1. **FMP earnings calendar works** — upcoming earnings for top 10 are discoverable
 2. **FMP historical data works** — 8 quarters of `(estimated, actual)` pairs available per ticker
 3. **FMP analyst estimates work** — current-quarter consensus with high/low/number of analysts
 4. **Both bucket strategies construct cleanly** — analyst-spread and historical-surprise-σ, side-by-side, on the same ticker
-5. **Upcoming-earnings discovery matches estimates to dates** — the data inputs a production daemon would need are all accessible via FMP
+5. **Upcoming-earnings discovery matches estimates to dates and times** — FMP estimates joined with Yahoo Finance scheduled-release timestamps and BMO/AMC markers
+6. **Yahoo timing pull for the top 10** — 100% coverage, full timezone-aware datetimes, BMO/AMC classification
 
 ---
 
@@ -222,10 +286,11 @@ truflation-eps-markets/
 ├── src/truflation_eps/
 │   ├── __init__.py
 │   ├── fmp_client.py         # live FMP earnings-calendar + analyst-estimates + earnings
+│   ├── yahoo_client.py       # Yahoo Finance — release-time secondary source (no key)
 │   ├── market_spec.py        # Strategy A (analyst-spread) + Strategy B (historical-σ) bucket construction
-│   └── calendar.py           # earnings-date discovery + matched analyst estimate
+│   └── calendar.py           # earnings-date discovery + matched estimate + Yahoo timing
 ├── scripts/
-│   └── probe_fmp.py          # end-to-end demonstration across all three FMP endpoints
+│   └── probe_fmp.py          # end-to-end demonstration across all FMP endpoints + Yahoo timing
 ├── tests/
 └── results/                  # probe outputs — CSVs per run
 ```
@@ -253,12 +318,14 @@ cp .env.example .env
 uv run python scripts/probe_fmp.py
 ```
 
-The probe runs all three FMP endpoints against the live API, demonstrates σ-calibrated bucket construction on TSLA, and writes four CSVs into `results/`:
+The probe runs the FMP endpoints against the live API, pulls release timing from Yahoo Finance, demonstrates σ-calibrated bucket construction on TSLA, and writes six CSVs into `results/`:
 
-- `probe_<timestamp>_calendar.csv` — upcoming + historical calendar rows
-- `probe_<timestamp>_historical.csv` — per-ticker history with estimates and actuals
-- `probe_<timestamp>_estimates.csv` — analyst consensus for upcoming quarters
+- `probe_<timestamp>_calendar.csv` — upcoming + historical calendar rows (FMP)
+- `probe_<timestamp>_historical.csv` — per-ticker history with estimates and actuals (FMP)
+- `probe_<timestamp>_estimates.csv` — analyst consensus for upcoming quarters (FMP)
 - `probe_<timestamp>_surprise_stats.csv` — mean and σ of surprise% per top-10 ticker
+- `probe_<timestamp>_yahoo_timing.csv` — next scheduled event per ticker with `scheduled_at`, `bmo_amc`, `surprise_pct` (Yahoo)
+- `probe_<timestamp>_upcoming.csv` — FMP estimates joined with Yahoo timing (the production-shaped row)
 
 ---
 
@@ -268,7 +335,7 @@ The following are intentionally left open for the production implementation to d
 
 1. **Daemon operationalization.** This is not a production daemon. A production deployment would wrap `fmp_client.py` in a scheduled poller, with retry logic, error handling, and signed broadcast to the stream.
 
-2. **Multi-source cross-check.** FMP is the primary source. Whether to add Yahoo Finance / IEX / Benzinga as secondaries for cross-verification is a production decision. Single-source is defensible for v1; multi-source is more robust against source-level error.
+2. **Multi-source cross-check.** FMP is the primary source for EPS values; Yahoo is wired in as a secondary for release timing (since FMP doesn't return it). Whether to extend secondary cross-checks to EPS values themselves (Yahoo / IEX / Benzinga) is a production decision. Single-source on the value side is defensible for v1; multi-source is more robust against source-level error.
 
 3. **Reference lock timing.** When to freeze the consensus `epsAvg` as the market's anchor (T−7? T−1? continuous rebalancing?) is a product-UX decision, not a data decision.
 
@@ -293,9 +360,9 @@ The following are intentionally left open for the production implementation to d
 If this proof-of-concept is adopted, productionization follows a three-phase path similar to other scheduled data-adapter deployments:
 
 - **Phase 1 — Daemon setup.** Deploy a scheduled poller wrapping `fmp_client.py`. Environment setup, API key management, error recovery, observability.
-- **Phase 2 — Stream adapter.** Receive `{ticker, quarter_end, epsActual, timestamp}` from the daemon, sign it, broadcast to the TN protocol as the stream's latest value.
+- **Phase 2 — Stream adapter.** Receive `{ticker, quarter_end, epsActual, scheduled_at, bmo_amc, timestamp}` from the daemon (EPS values from FMP, scheduled timing captured from Yahoo at announcement), sign it, broadcast to the TN protocol as the stream's latest value.
 - **Phase 3 — Universe expansion.** Config-driven ticker list so adding new companies is a configuration entry, not a code change.
 
-`fmp_client.py` and `calendar.py` can be copied into the daemon codebase directly. `market_spec.py` is reference material for whoever creates the downstream markets.
+`fmp_client.py`, `yahoo_client.py`, and `calendar.py` can be copied into the daemon codebase directly. `market_spec.py` is reference material for whoever creates the downstream markets.
 
 ---

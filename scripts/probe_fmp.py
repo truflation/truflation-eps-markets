@@ -32,10 +32,12 @@ from truflation_eps.market_spec import (
     surprise_sigma_buckets,
 )
 from truflation_eps.calendar import discover_upcoming
+from truflation_eps.yahoo_client import YahooClient
 
 
 def main() -> None:
     client = FMPClient()
+    yahoo = YahooClient()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     results_dir = Path(__file__).resolve().parents[1] / "results"
     results_dir.mkdir(exist_ok=True)
@@ -161,22 +163,48 @@ def main() -> None:
         print(f"  ERROR: {exc}")
     print()
 
-    # ─── 5. Upcoming earnings discovery with matched estimates ───────
+    # ─── 5. Upcoming earnings discovery with matched estimates + timing ─
     print("=" * 72)
-    print("5. Upcoming-earnings discovery (matched with analyst estimates)")
+    print("5. Upcoming-earnings discovery (FMP estimates + Yahoo timing)")
     print("=" * 72)
+    upcoming_list = []
     try:
-        upcoming_list = discover_upcoming(client, lookahead_days=90)
-        print(f"{'Symbol':8s} {'EarningsDate':14s} {'MatchedQE':14s} {'EpsAvg':>8s} {'High':>8s} {'Low':>8s} {'N':>4s}")
+        upcoming_list = discover_upcoming(client, lookahead_days=90, yahoo=yahoo)
+        header = f"{'Symbol':8s} {'EarningsDate':14s} {'BMO/AMC':8s} {'ScheduledAt':28s} {'EpsAvg':>8s} {'High':>8s} {'Low':>8s} {'N':>4s}"
+        print(header)
         for u in upcoming_list:
             est = u.estimate
+            timing = (u.release_timing or '').upper() or '-'
+            scheduled = u.scheduled_at or '-'
             if est:
-                print(f"{u.symbol:8s} {u.earnings_date:14s} {est.quarter_end:14s} "
+                print(f"{u.symbol:8s} {u.earnings_date:14s} {timing:8s} {scheduled:28s} "
                       f"{est.eps_avg:>8.3f} {est.eps_high:>8.3f} {est.eps_low:>8.3f} {est.n_analysts:>4d}")
             else:
-                print(f"{u.symbol:8s} {u.earnings_date:14s} (no estimate matched)")
+                print(f"{u.symbol:8s} {u.earnings_date:14s} {timing:8s} {scheduled:28s} (no estimate matched)")
     except Exception as exc:
         print(f"  ERROR: {exc}")
+    print()
+
+    # ─── 6. Yahoo timing — full table for top 10 ─────────────────────
+    print("=" * 72)
+    print("6. Yahoo Finance — release timing for top 10 (next event each)")
+    print("=" * 72)
+    yahoo_rows = []
+    print(f"{'Symbol':8s} {'ScheduledAt':32s} {'BMO/AMC':8s} {'EpsEst':>8s} {'EpsAct':>8s}")
+    for sym in TOP_10:
+        try:
+            ev = yahoo.next_event(sym)
+        except Exception as exc:
+            print(f"  {sym}: ERROR — {exc}")
+            continue
+        if ev is None:
+            print(f"  {sym}: no upcoming event")
+            continue
+        yahoo_rows.append(ev)
+        timing = (ev.bmo_amc or '-').upper()
+        eps_est = f"{ev.eps_estimated:.3f}" if ev.eps_estimated is not None else '-'
+        eps_act = f"{ev.eps_actual:.3f}" if ev.eps_actual is not None else '-'
+        print(f"{sym:8s} {ev.scheduled_at:32s} {timing:8s} {eps_est:>8s} {eps_act:>8s}")
     print()
 
     # ─── CSV dumps ────────────────────────────────────────────────────
@@ -217,6 +245,33 @@ def main() -> None:
         for sym, s in surprise_stats.items():
             w.writerow([sym, s["n"], f"{s['mean']*100:.4f}", f"{s['sigma']*100:.4f}"])
     print(f"Surprise stats → {out}")
+
+    out = results_dir / f"probe_{stamp}_yahoo_timing.csv"
+    with out.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["symbol", "scheduled_at", "date", "hour_et", "bmo_amc",
+                    "eps_estimated", "eps_actual", "surprise_pct"])
+        for ev in yahoo_rows:
+            w.writerow([ev.symbol, ev.scheduled_at, ev.date, ev.hour_et, ev.bmo_amc,
+                        ev.eps_estimated, ev.eps_actual, ev.surprise_pct])
+    print(f"Yahoo timing → {out}")
+
+    out = results_dir / f"probe_{stamp}_upcoming.csv"
+    with out.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["symbol", "earnings_date", "release_timing", "scheduled_at",
+                    "matched_quarter_end", "eps_avg", "eps_high", "eps_low", "n_analysts"])
+        for u in upcoming_list:
+            est = u.estimate
+            w.writerow([
+                u.symbol, u.earnings_date, u.release_timing or "", u.scheduled_at or "",
+                est.quarter_end if est else "",
+                est.eps_avg if est else "",
+                est.eps_high if est else "",
+                est.eps_low if est else "",
+                est.n_analysts if est else "",
+            ])
+    print(f"Upcoming (FMP+Yahoo joined) → {out}")
 
 
 if __name__ == "__main__":
